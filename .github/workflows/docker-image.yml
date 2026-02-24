@@ -10,13 +10,22 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
+      
+      - name: Get version
+        id: version
+        run: echo "VERSION=$(node -p "require('./package.json').version")" >> $GITHUB_OUTPUT
+      
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+          
       - uses: docker/build-push-action@v5
         with:
           context: .
           push: true
-          tags: ghcr.io/micasa96/9router:latest
+          tags: |
+            ghcr.io/micasa96/9router:latest
+            ghcr.io/micasa96/9router:${{ steps.version.outputs.VERSION }}
+            ghcr.io/micasa96/9router:${{ steps.version.outputs.VERSION }}-${{ github.run_number }}
