@@ -1,4 +1,4 @@
-const { spawn, exec } = require("child_process");
+const { exec, spawn, execSync } = require("child_process");
 const path = require("path");
 const fs = require("fs");
 const os = require("os");
@@ -41,6 +41,43 @@ const SERVER_PATH = resolveServerPath();
 const ENCRYPT_ALGO = "aes-256-gcm";
 const ENCRYPT_SALT = "9router-mitm-pwd";
 
+/**
+ * Get process name using port 443
+ * @returns {string|null} Process name or null if not found
+ */
+function getProcessUsingPort443() {
+  try {
+    if (IS_WIN) {
+      // Windows: use netstat to find PID, then tasklist to get process name
+      const netstatResult = execSync("netstat -ano | findstr :443", { encoding: "utf8" });
+      const lines = netstatResult.trim().split("\n");
+      if (lines.length > 0) {
+        // Extract PID from last column (format: TCP 0.0.0.0:443 0.0.0.0:0 LISTENING 1234)
+        const pidMatch = lines[0].match(/\s+(\d+)\s*$/);
+        if (pidMatch) {
+          const pid = pidMatch[1];
+          const tasklistResult = execSync(`tasklist /FI "PID eq ${pid}" /FO CSV /NH`, { encoding: "utf8" });
+          const processMatch = tasklistResult.match(/"([^"]+)"/);
+          if (processMatch) {
+            return processMatch[1].replace(".exe", "");
+          }
+        }
+      }
+    } else {
+      // macOS/Linux: use lsof
+      const result = execSync("lsof -i :443", { encoding: "utf8" });
+      const lines = result.trim().split("\n");
+      if (lines.length > 1) {
+        const processName = lines[1].split(/\s+/)[0];
+        return processName;
+      }
+    }
+  } catch (error) {
+    return null;
+  }
+  return null;
+}
+
 // Store server process in-memory
 let serverProcess = null;
 let serverPid = null;
@@ -65,11 +102,11 @@ function isProcessAlive(pid) {
 function killProcess(pid, force = false) {
   if (IS_WIN) {
     const flag = force ? "/F " : "";
-    exec(`taskkill ${flag}/PID ${pid}`, () => {});
+    exec(`taskkill ${flag}/PID ${pid}`, () => { });
   } else {
     // Use pkill to kill entire process group (catches sudo + child node process)
     const sig = force ? "SIGKILL" : "SIGTERM";
-    exec(`pkill -${sig} -P ${pid} 2>/dev/null; kill -${sig} ${pid} 2>/dev/null`, () => {});
+    exec(`pkill -${sig} -P ${pid} 2>/dev/null; kill -${sig} ${pid} 2>/dev/null`, () => { });
   }
 }
 
@@ -231,9 +268,9 @@ async function killLeftoverMitm(sudoPassword) {
       const escaped = SERVER_PATH.replace(/'/g, "'\\''");
       if (sudoPassword) {
         const { execWithPassword } = require("./dns/dnsConfig");
-        await execWithPassword(`pkill -SIGKILL -f "${escaped}" 2>/dev/null || true`, sudoPassword).catch(() => {});
+        await execWithPassword(`pkill -SIGKILL -f "${escaped}" 2>/dev/null || true`, sudoPassword).catch(() => { });
       } else {
-        exec(`pkill -SIGKILL -f "${escaped}" 2>/dev/null || true`, () => {});
+        exec(`pkill -SIGKILL -f "${escaped}" 2>/dev/null || true`, () => { });
       }
       await new Promise(r => setTimeout(r, 500));
     } catch { /* ignore */ }
@@ -378,7 +415,7 @@ async function startMitm(apiKey, sudoPassword) {
   const certAlreadyInstalled = settings.mitmCertInstalled && fs.existsSync(certPath);
   if (!certAlreadyInstalled) {
     await installCert(sudoPassword, certPath);
-    if (_updateSettings) await _updateSettings({ mitmCertInstalled: true }).catch(() => {});
+    if (_updateSettings) await _updateSettings({ mitmCertInstalled: true }).catch(() => { });
   }
 
   // 3. Add DNS entry
@@ -389,13 +426,14 @@ async function startMitm(apiKey, sudoPassword) {
   console.log("Starting MITM server...");
 
   if (IS_WIN) {
-    // Launch elevated node via PowerShell RunAs (triggers UAC prompt)
-    const nodePath = process.execPath.replace(/'/g, "''");
-    const serverPath = SERVER_PATH.replace(/'/g, "''");
+    // Use cmd /c to set env vars inline before launching node (env vars survive RunAs)
+    const nodePath = process.execPath.replace(/"/g, '\\"');
+    const serverPath = SERVER_PATH.replace(/"/g, '\\"');
+    const cmdLine = `set ROUTER_API_KEY=${apiKey}&& set NODE_ENV=production&& "${nodePath}" "${serverPath}"`;
     serverProcess = spawn("powershell", [
       "-NoProfile", "-Command",
-      `$env:ROUTER_API_KEY='${apiKey}'; $env:NODE_ENV='production'; Start-Process '${nodePath}' -ArgumentList '''${serverPath}''' -Verb RunAs -WindowStyle Hidden`
-    ], { stdio: "ignore", env: process.env });
+      `Start-Process cmd -ArgumentList '/c','${cmdLine.replace(/'/g, "''")}' -Verb RunAs -WindowStyle Hidden`
+    ], { stdio: "ignore" });
   } else {
     // sudo -S: read password from stdin, -E: preserve env vars
     // Pass ROUTER_API_KEY inline via env=... wrapper to avoid sudo stripping env
@@ -413,23 +451,25 @@ async function startMitm(apiKey, sudoPassword) {
   fs.writeFileSync(PID_FILE, String(serverPid));
 
   let startError = null;
-  serverProcess.stdout.on("data", (data) => {
-    console.log(`[MITM Server] ${data.toString().trim()}`);
-  });
-  serverProcess.stderr.on("data", (data) => {
-    const msg = data.toString().trim();
-    // Capture meaningful errors (ignore sudo password prompt noise)
-    if (msg && !msg.includes("Password:") && !msg.includes("password for")) {
-      console.error(`[MITM Server Error] ${msg}`);
-      startError = msg;
-    }
-  });
-  serverProcess.on("exit", (code) => {
-    console.log(`MITM server exited with code ${code}`);
-    serverProcess = null;
-    serverPid = null;
-    try { fs.unlinkSync(PID_FILE); } catch { /* ignore */ }
-  });
+  if (!IS_WIN) {
+    serverProcess.stdout.on("data", (data) => {
+      console.log(`[MITM Server] ${data.toString().trim()}`);
+    });
+    serverProcess.stderr.on("data", (data) => {
+      const msg = data.toString().trim();
+      // Capture meaningful errors (ignore sudo password prompt noise)
+      if (msg && !msg.includes("Password:") && !msg.includes("password for")) {
+        console.error(`[MITM Server Error] ${msg}`);
+        startError = msg;
+      }
+    });
+    serverProcess.on("exit", (code) => {
+      console.log(`MITM server exited with code ${code}`);
+      serverProcess = null;
+      serverPid = null;
+      try { fs.unlinkSync(PID_FILE); } catch { /* ignore */ }
+    });
+  }
 
   // Wait for server to be ready by polling health endpoint
   const health = await pollMitmHealth(IS_WIN ? 12000 : 8000);
@@ -437,7 +477,9 @@ async function startMitm(apiKey, sudoPassword) {
   if (!health) {
     if (IS_WIN) serverProcess = null;
     try { await removeDNSEntry(sudoPassword); } catch { /* best effort */ }
-    const reason = startError || "Check sudo password or port 443 access.";
+    const processUsing443 = getProcessUsingPort443();
+    const portInfo = processUsing443 ? ` Port 443 already in use by ${processUsing443}.` : "";
+    const reason = startError || `Check sudo password or port 443 access.${portInfo}`;
     throw new Error(`MITM server failed to start. ${reason}`);
   }
 
